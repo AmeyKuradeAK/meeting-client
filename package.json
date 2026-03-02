@@ -1,0 +1,16 @@
+{
+    "name": "onebudd-meeting-client",
+    "version": "1.0.0",
+    "description": "Standalone audio bridge for Joy Meeting Assistant — captures Teams audio and streams to onebudd-realtime",
+    "main": "src/index.js",
+    "scripts": {
+        "start": "node src/index.js",
+        "dev": "node --watch src/index.js",
+        "list-devices": "node src/list-devices.js"
+    },
+    "dependencies": {
+        "dotenv": "^16.4.5",
+        "puppeteer": "^22.6.0",
+        "ws": "^8.18.0"
+    }
+}
