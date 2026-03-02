@@ -1,17 +1,18 @@
 /**
  * Joy Meeting Client — Standalone Audio Bridge (Ubuntu / PulseAudio)
- * 
+ *
  * Captures audio from a PulseAudio monitor (meeting output), streams it to
  * onebudd-realtime via WebSocket, and plays back TTS responses through
  * a PulseAudio sink (meeting input) using `paplay`.
  * Launches Google Meet in headless Chrome via Puppeteer.
- * 
+ *
  * Prerequisites:
- *   1. pulseaudio and Xvfb installed
- *   2. VirtualPulse audio devices configured
+ *   1. pulseaudio and Xvfb installed and running
+ *   2. VirtualSpeaker (null sink) and VirtualMic (virtual source) configured
  *   3. onebudd-realtime server running
- * 
- * Usage: npm start
+ *   4. DISPLAY=:99 exported in environment
+ *
+ * Usage: node bot.js
  */
 
 require('dotenv').config();
@@ -23,80 +24,207 @@ const puppeteer = require('puppeteer');
 // Configuration (from .env)
 // ============================================================================
 const config = {
-    wsUrl: process.env.PIPELINE_WS_URL || 'ws://localhost:8080',
-    apiKey: process.env.API_KEY || '',
-    meetUrl: process.env.MEET_URL || '',
-    inputDevice: process.env.INPUT_DEVICE || 'VirtualSpeaker.monitor', // parec capture
-    outputDevice: process.env.OUTPUT_DEVICE || 'VirtualSpeaker',       // paplay injection
-    sampleRate: parseInt(process.env.SAMPLE_RATE || '16000'),
-    channels: parseInt(process.env.CHANNELS || '1'),
-    bitsPerSample: parseInt(process.env.BITS_PER_SAMPLE || '16'),
-    wakeWord: process.env.WAKE_WORD || 'hey joy',
-    language: process.env.LANGUAGE || 'en-US',
-    // Client-side control
-    cancelPhrases: (process.env.CANCEL_PHRASES || 'never mind,cancel,stop,ignore that')
-        .split(',')
-        .map(p => p.trim().toLowerCase())
-        .filter(Boolean),
-    interruptOnSpeech: (process.env.INTERRUPT_ON_SPEECH || 'true').toLowerCase() === 'true',
-    interruptOnCancel: (process.env.INTERRUPT_ON_CANCEL || 'true').toLowerCase() === 'true',
-    vadThreshold: parseFloat(process.env.VAD_THRESHOLD || '0.02'),
-    interruptCooldownMs: parseInt(process.env.INTERRUPT_COOLDOWN_MS || '1200'),
-    minQueryChars: parseInt(process.env.MIN_QUERY_CHARS || '3'),
-    minQueryWords: parseInt(process.env.MIN_QUERY_WORDS || '4'),
-    activationTimeoutMs: parseInt(process.env.ACTIVATION_TIMEOUT_MS || '1500')
+    wsUrl:               process.env.PIPELINE_WS_URL  || 'ws://localhost:8080',
+    apiKey:              process.env.API_KEY           || '',
+    meetUrl:             process.env.MEET_URL          || '',
+    botName:             process.env.BOT_NAME          || 'Joy',
+    inputDevice:         process.env.INPUT_DEVICE      || 'VirtualSpeaker.monitor',
+    outputDevice:        process.env.OUTPUT_DEVICE     || 'VirtualSpeaker',
+    sampleRate:          parseInt(process.env.SAMPLE_RATE     || '16000'),
+    channels:            parseInt(process.env.CHANNELS        || '1'),
+    bitsPerSample:       parseInt(process.env.BITS_PER_SAMPLE || '16'),
+    wakeWord:            process.env.WAKE_WORD         || 'hey joy',
+    language:            process.env.LANGUAGE          || 'en-US',
+    cancelPhrases:       (process.env.CANCEL_PHRASES   || 'never mind,cancel,stop,ignore that')
+                            .split(',').map(p => p.trim().toLowerCase()).filter(Boolean),
+    interruptOnSpeech:   (process.env.INTERRUPT_ON_SPEECH  || 'true').toLowerCase() === 'true',
+    interruptOnCancel:   (process.env.INTERRUPT_ON_CANCEL  || 'true').toLowerCase() === 'true',
+    vadThreshold:        parseFloat(process.env.VAD_THRESHOLD        || '0.02'),
+    interruptCooldownMs: parseInt(process.env.INTERRUPT_COOLDOWN_MS  || '1200'),
+    minQueryChars:       parseInt(process.env.MIN_QUERY_CHARS        || '3'),
+    minQueryWords:       parseInt(process.env.MIN_QUERY_WORDS        || '4'),
+    activationTimeoutMs: parseInt(process.env.ACTIVATION_TIMEOUT_MS  || '1500'),
+    admitTimeoutMs:      parseInt(process.env.ADMIT_TIMEOUT_MS       || '120000'),
 };
 
 // ============================================================================
 // State
 // ============================================================================
-let ws = null;
-let recordingProcess = null;
-let paplayProcess = null;
-let isConnected = false;
-let reconnectTimer = null;
-let audioChunkCount = 0;
-let ttsChunkCount = 0;
-let isBotSpeaking = false;
-let lastInterruptAt = 0;
-let ignoreTtsUntil = 0;
-let activationTimer = null;
+let ws                 = null;
+let recordingProcess   = null;
+let paplayProcess      = null;
+let isConnected        = false;
+let reconnectTimer     = null;
+let audioChunkCount    = 0;
+let ttsChunkCount      = 0;
+let isBotSpeaking      = false;
+let lastInterruptAt    = 0;
+let ignoreTtsUntil     = 0;
+let activationTimer    = null;
 let activationTimedOut = false;
-let browser = null;
+let browser            = null;
 
 // ============================================================================
-// Puppeteer Headless Launch (Google Meet)
+// Puppeteer — Launch Chrome + Join Google Meet
 // ============================================================================
 async function launchBrowser() {
     console.log('\n🚀 Starting headless Chrome via Puppeteer...');
+
     try {
         browser = await puppeteer.launch({
-            headless: false, // Run in Xvfb display
+            headless: false, // must be false for WebRTC audio to work in Xvfb
             env: {
                 ...process.env,
-                DISPLAY: ':99'
+                DISPLAY: process.env.DISPLAY || ':99',
             },
             args: [
-                '--use-fake-ui-for-media-stream',
+                '--use-fake-ui-for-media-stream',   // auto-grant mic/cam permissions
                 '--disable-gpu',
                 '--no-sandbox',
                 '--disable-dev-shm-usage',
-                '--display=:99'
-            ]
+                '--disable-features=VizDisplayCompositor',
+                '--autoplay-policy=no-user-gesture-required',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                `--display=${process.env.DISPLAY || ':99'}`,
+            ],
+            ignoreDefaultArgs: ['--mute-audio'],
         });
 
         const page = await browser.newPage();
 
-        if (config.meetUrl) {
-            console.log(`🌐 Navigating to Google Meet: ${config.meetUrl}`);
-            await page.goto(config.meetUrl, { waitUntil: 'networkidle2' });
-            console.log('✅ Google Meet loaded (Mic/Camera access automatically allowed)');
-        } else {
-            console.log('⚠️ No MEET_URL specified in .env. Browser launched successfully.');
+        // Grant permissions at context level
+        const context = browser.defaultBrowserContext();
+        await context.overridePermissions('https://meet.google.com', [
+            'microphone',
+            'camera',
+            'notifications',
+        ]);
+
+        // Set a realistic user agent so Google doesn't block headless
+        await page.setUserAgent(
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        );
+
+        if (!config.meetUrl) {
+            console.log('⚠️  No MEET_URL set in .env — browser launched but not joining any meeting.');
+            return;
+        }
+
+        console.log(`🌐 Navigating to Google Meet: ${config.meetUrl}`);
+        await page.goto(config.meetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        console.log('✅ Page loaded');
+
+        // ── Step 1: Dismiss "Sign in" / "Continue as guest" prompt ──────────
+        try {
+            await page.waitForFunction(
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    return btns.some(b =>
+                        b.innerText.includes('without') ||
+                        b.innerText.includes('guest')   ||
+                        b.innerText.includes('Continue')
+                    );
+                },
+                { timeout: 8000 }
+            );
+
+            const buttons = await page.$$('button');
+            for (const btn of buttons) {
+                const text = await btn.evaluate(el => el.innerText.trim());
+                if (
+                    text.toLowerCase().includes('without') ||
+                    text.toLowerCase().includes('guest')   ||
+                    text.toLowerCase().includes('continue')
+                ) {
+                    await btn.click();
+                    console.log(`✅ Dismissed sign-in prompt ("${text}")`);
+                    await sleep(1500);
+                    break;
+                }
+            }
+        } catch (_) {
+            console.log('ℹ️  No sign-in prompt detected, continuing...');
+        }
+
+        // ── Step 2: Enter bot name ───────────────────────────────────────────
+        try {
+            await page.waitForSelector('input[placeholder="Your name"]', { timeout: 10000 });
+            await page.click('input[placeholder="Your name"]');
+            await page.keyboard.type(config.botName);
+            console.log(`✅ Name entered: "${config.botName}"`);
+            await sleep(500);
+        } catch (_) {
+            console.log('ℹ️  No name input field found, skipping...');
+        }
+
+        // ── Step 3: Turn off camera (if not already off) ─────────────────────
+        try {
+            const camButtons = await page.$$('[aria-label*="camera"], [aria-label*="Camera"]');
+            for (const btn of camButtons) {
+                const muted = await btn.evaluate(el => el.getAttribute('data-is-muted'));
+                if (muted === 'false') {
+                    await btn.click();
+                    console.log('✅ Camera turned off');
+                    await sleep(300);
+                }
+            }
+        } catch (_) {
+            console.log('ℹ️  Could not toggle camera, skipping...');
+        }
+
+        // ── Step 4: Click "Ask to join" / "Join now" ─────────────────────────
+        try {
+            console.log('⏳ Waiting for join button...');
+            await page.waitForFunction(
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    return btns.some(b =>
+                        b.innerText.includes('Ask to join')    ||
+                        b.innerText.includes('Join now')       ||
+                        b.innerText.includes('Request to join')
+                    );
+                },
+                { timeout: 15000 }
+            );
+
+            const buttons = await page.$$('button');
+            for (const btn of buttons) {
+                const text = await btn.evaluate(el => el.innerText.trim());
+                if (
+                    text.includes('Ask to join')    ||
+                    text.includes('Join now')        ||
+                    text.includes('Request to join')
+                ) {
+                    await btn.click();
+                    console.log(`✅ Clicked join button: "${text}"`);
+                    break;
+                }
+            }
+        } catch (e) {
+            console.error('❌ Could not find join button:', e.message);
+        }
+
+        // ── Step 5: Wait to be admitted into the meeting ──────────────────────
+        console.log('⏳ Waiting in lobby — please admit Joy from your Google Meet...');
+        try {
+            await page.waitForFunction(
+                () =>
+                    document.querySelector('[aria-label*="Chat"]')        ||
+                    document.querySelector('[aria-label*="chat"]')        ||
+                    document.querySelector('[aria-label*="participant"]') ||
+                    document.querySelector('[data-call-ended]'),
+                { timeout: config.admitTimeoutMs }
+            );
+            console.log('🎉 Joy is now inside the meeting! Audio pipeline starting...');
+        } catch (_) {
+            console.log('⚠️  Timed out waiting to be admitted. Bot is still running — admit manually if needed.');
         }
 
     } catch (err) {
-        console.error('❌ Failed to launch Puppeteer:', err.message);
+        console.error('❌ Failed to launch browser:', err.message);
     }
 }
 
@@ -114,7 +242,7 @@ function buildWsUrl() {
 
 function connect() {
     const wsUrl = buildWsUrl();
-    console.log(`\n🔌 Connecting to: ${wsUrl}`);
+    console.log(`\n🔌 Connecting to pipeline: ${wsUrl}`);
 
     ws = new WebSocket(wsUrl);
 
@@ -122,19 +250,17 @@ function connect() {
         isConnected = true;
         console.log('✅ Connected to onebudd-realtime pipeline');
 
-        // Send initial config
         const configMsg = {
-            type: 'config',
-            sampleRate: config.sampleRate,
-            encoding: 'pcm_s16le',
-            language: config.language,
+            type:        'config',
+            sampleRate:  config.sampleRate,
+            encoding:    'pcm_s16le',
+            language:    config.language,
             meetingMode: true,
-            wakeWord: config.wakeWord,
+            wakeWord:    config.wakeWord,
         };
         ws.send(JSON.stringify(configMsg));
         console.log('📤 Sent config:', JSON.stringify(configMsg));
 
-        // Start capturing audio
         startAudioCapture();
     });
 
@@ -143,13 +269,10 @@ function connect() {
             handleTTSAudio(data);
             return;
         }
-
         try {
             const msg = JSON.parse(data.toString());
             handleServerMessage(msg);
-        } catch (e) {
-            // Ignore non-JSON
-        }
+        } catch (_) {}
     });
 
     ws.on('close', (code, reason) => {
@@ -160,7 +283,7 @@ function connect() {
     });
 
     ws.on('error', (err) => {
-        console.error('⚠️ WebSocket error:', err.message);
+        console.error('⚠️  WebSocket error:', err.message);
     });
 }
 
@@ -180,19 +303,19 @@ function sendControl(type) {
 }
 
 // ============================================================================
-// Audio Capture (PulseAudio parec → Pipeline)
+// Audio Capture — PulseAudio parec → WebSocket
 // ============================================================================
 function startAudioCapture() {
     console.log('\n🎙️  Starting audio capture via parec...');
-    console.log(`   Capture source: "${config.inputDevice}"`);
+    console.log(`   Source device: "${config.inputDevice}"`);
 
     try {
         recordingProcess = spawn('parec', [
-            '--device=' + config.inputDevice,
+            `--device=${config.inputDevice}`,
             '--raw',
-            '--channels=' + config.channels,
-            '--rate=' + config.sampleRate,
-            '--format=s16le'
+            `--channels=${config.channels}`,
+            `--rate=${config.sampleRate}`,
+            '--format=s16le',
         ]);
 
         recordingProcess.stdout.on('data', (chunk) => {
@@ -203,21 +326,26 @@ function startAudioCapture() {
                 ws.send(chunk);
                 audioChunkCount++;
                 if (audioChunkCount % 100 === 0) {
-                    process.stdout.write(`\r📡 Audio chunks sent: ${audioChunkCount} | TTS chunks received: ${ttsChunkCount}`);
+                    process.stdout.write(
+                        `\r📡 Audio sent: ${audioChunkCount} chunks | TTS received: ${ttsChunkCount} chunks`
+                    );
                 }
             }
         });
 
+        recordingProcess.stderr.on('data', (data) => {
+            console.error('\n⚠️  parec stderr:', data.toString().trim());
+        });
+
         recordingProcess.on('error', (err) => {
-            console.error('\n⚠️ Audio capture error:', err.message);
-            console.log('   Make sure PulseAudio is running and parecord is available.');
+            console.error('\n⚠️  Audio capture error:', err.message);
         });
 
         recordingProcess.on('close', (code) => {
-            console.log(`\n🛑 parec process exited with code ${code}`);
+            console.log(`\n🛑 parec exited with code ${code}`);
         });
 
-        console.log('🟢 Audio capture active (parec running)');
+        console.log('🟢 Audio capture active');
     } catch (err) {
         console.error('❌ Failed to start audio capture:', err.message);
     }
@@ -225,30 +353,31 @@ function startAudioCapture() {
 
 function stopAudioCapture() {
     if (recordingProcess) {
-        try {
-            recordingProcess.kill('SIGTERM');
-        } catch (e) { /* ignore */ }
+        try { recordingProcess.kill('SIGTERM'); } catch (_) {}
         recordingProcess = null;
         console.log('🛑 Audio capture stopped');
     }
 }
 
 // ============================================================================
-// TTS Playback (Pipeline → PulseAudio paplay)
+// TTS Playback — WebSocket audio → paplay → VirtualSpeaker → Meet mic
 // ============================================================================
 function ensurePaplay() {
     if (!paplayProcess) {
         paplayProcess = spawn('paplay', [
-            '--device=' + config.outputDevice,
+            `--device=${config.outputDevice}`,
             '--raw',
-            '--channels=' + config.channels,
-            '--rate=' + config.sampleRate,
-            '--format=s16le'
+            `--channels=${config.channels}`,
+            `--rate=${config.sampleRate}`,
+            '--format=s16le',
         ]);
 
         paplayProcess.stdin.on('error', (err) => {
-            // Usually happens if process closes prematurely
-            console.error('\n⚠️ paplay stdin write error:', err.message);
+            console.error('\n⚠️  paplay stdin error:', err.message);
+        });
+
+        paplayProcess.stderr.on('data', (data) => {
+            console.error('\n⚠️  paplay stderr:', data.toString().trim());
         });
 
         paplayProcess.on('close', () => {
@@ -256,7 +385,7 @@ function ensurePaplay() {
         });
 
         paplayProcess.on('error', (err) => {
-            console.error('\n⚠️ paplay spawn error:', err.message);
+            console.error('\n⚠️  paplay spawn error:', err.message);
             paplayProcess = null;
         });
     }
@@ -289,6 +418,7 @@ function handleTTSAudio(audioBuffer) {
 // ============================================================================
 function handleServerMessage(msg) {
     switch (msg.type) {
+
         case 'transcript':
             if (msg.is_final) {
                 console.log(`\n📝 [${msg.source || 'user'}]: ${msg.text}`);
@@ -301,30 +431,35 @@ function handleServerMessage(msg) {
             break;
 
         case 'meeting_transcript':
-            console.log(`\n📝 [${msg.speaker}] ${msg.text}`);
+            console.log(`\n📝 [${msg.speaker || 'speaker'}]: ${msg.text}`);
             break;
 
         case 'meeting_activation':
             if (msg.status === 'activated') {
                 console.log(`\n🎤 ✨ JOY ACTIVATED! Query: "${msg.query || ''}"`);
                 const queryText = (msg.query || '').trim();
-                const wordCount = queryText.length === 0 ? 0 : queryText.split(/\s+/).filter(Boolean).length;
+                const wordCount = queryText.length === 0
+                    ? 0
+                    : queryText.split(/\s+/).filter(Boolean).length;
+
                 if (queryText.length < config.minQueryChars || wordCount < config.minQueryWords) {
-                    console.log('🚫 Ignoring activation: query too short');
+                    console.log('🚫 Ignoring: query too short');
                     triggerInterrupt('empty_query');
                     isBotSpeaking = false;
                     break;
                 }
+
                 activationTimedOut = false;
                 if (activationTimer) clearTimeout(activationTimer);
                 activationTimer = setTimeout(() => {
                     activationTimedOut = true;
-                    console.log('🚫 Activation timed out (late query)');
+                    console.log('🚫 Activation timed out');
                     triggerInterrupt('activation_timeout');
                 }, config.activationTimeoutMs);
+
                 isBotSpeaking = true;
             } else if (msg.status === 'idle') {
-                console.log('🔇 Joy is idle (listening)');
+                console.log('🔇 Joy is idle (listening for wake word)');
                 isBotSpeaking = false;
             }
             break;
@@ -343,9 +478,8 @@ function handleServerMessage(msg) {
             break;
 
         case 'audio_end':
-            // Can optionally close paplay stdin to flush audio accurately
             if (paplayProcess) {
-                try { paplayProcess.stdin.end(); } catch (e) { /* ignore */ }
+                try { paplayProcess.stdin.end(); } catch (_) {}
                 paplayProcess = null;
             }
             isBotSpeaking = false;
@@ -354,6 +488,7 @@ function handleServerMessage(msg) {
                 clearTimeout(activationTimer);
                 activationTimer = null;
             }
+            console.log('\n🔇 TTS finished — Joy is listening again');
             break;
 
         default:
@@ -371,11 +506,11 @@ function triggerInterrupt(reason) {
     if (now - lastInterruptAt < config.interruptCooldownMs) return;
     lastInterruptAt = now;
     ignoreTtsUntil = now + 1500;
-    console.log(`\n⛔ Interrupt sent (${reason})`);
+    console.log(`\n⛔ Interrupt triggered (${reason})`);
     sendControl('interrupt');
 
     if (paplayProcess) {
-        try { paplayProcess.kill('SIGTERM'); } catch (e) { /* ignore */ }
+        try { paplayProcess.kill('SIGTERM'); } catch (_) {}
         paplayProcess = null;
     }
 }
@@ -395,34 +530,44 @@ function maybeInterruptOnSpeech(chunk) {
 }
 
 // ============================================================================
+// Utility
+// ============================================================================
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ============================================================================
 // Startup
 // ============================================================================
 console.log('╔══════════════════════════════════════════════════════════╗');
-console.log('║          🤖 Joy Meeting Client (Ubuntu/PulseAudio)     ║');
+console.log('║         🤖  Joy Meeting Client  (Ubuntu / PulseAudio)  ║');
 console.log('╚══════════════════════════════════════════════════════════╝');
 console.log('');
-console.log(`Pipeline URL : ${config.wsUrl}`);
-console.log(`Wake Word    : "${config.wakeWord}"`);
-console.log(`Sample Rate  : ${config.sampleRate} Hz`);
-console.log(`Input Device : ${config.inputDevice}`);
-console.log(`Output Device: ${config.outputDevice}`);
+console.log(`Pipeline URL  : ${config.wsUrl}`);
+console.log(`Wake Word     : "${config.wakeWord}"`);
+console.log(`Bot Name      : "${config.botName}"`);
+console.log(`Sample Rate   : ${config.sampleRate} Hz`);
+console.log(`Input Device  : ${config.inputDevice}`);
+console.log(`Output Device : ${config.outputDevice}`);
+console.log(`Meet URL      : ${config.meetUrl || '(not set)'}`);
+console.log('');
 
-// Launch Puppeteer then connect to WS
+// Launch browser first, then connect WebSocket
 launchBrowser().then(() => {
     connect();
 });
 
-// Graceful shutdown
+// ============================================================================
+// Graceful Shutdown
+// ============================================================================
 process.on('SIGINT', async () => {
     console.log('\n\n👋 Shutting down Joy Meeting Client...');
     stopAudioCapture();
     if (paplayProcess) {
-        try { paplayProcess.kill('SIGTERM'); } catch (e) { /* ignore */ }
+        try { paplayProcess.kill('SIGTERM'); } catch (_) {}
     }
     if (ws) ws.close();
-    if (browser) {
-        await browser.close();
-    }
+    if (browser) await browser.close();
     process.exit(0);
 });
 
